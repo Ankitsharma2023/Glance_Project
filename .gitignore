@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Raw datasets
+data/raw/
+data/raw_baseline_v1/
+
+# Generated embeddings and FAISS indexes
+data/features/*.npy
+data/features/*.faiss
+
+# Generated outputs
+outputs/
+
+# Generated evaluation artifacts
+evaluation/retrieval_results.csv
+evaluation/ablation_results.csv
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs / temporary files
+*.log
+*.tmp
+*.temp
