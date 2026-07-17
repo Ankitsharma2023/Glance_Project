@@ -10,7 +10,7 @@ from PIL import Image
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
 
-from src.indexer.encoders import FashionCLIPEncoder
+from src.indexer.encoders import FashionCLIPEncoder, norm_path
 
 
 REGIONS_PATH = (
@@ -180,7 +180,7 @@ def main():
     for position, row in regions.iterrows():
         image_path = (
             PROJECT_ROOT
-            / row["image_path"]
+            / norm_path(row["image_path"])
         )
 
         image_path_string = str(image_path)

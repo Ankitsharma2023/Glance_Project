@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(PROJECT_ROOT))
 
 
-from src.indexer.encoders import FashionCLIPEncoder
+from src.indexer.encoders import FashionCLIPEncoder, norm_path
 
 
 MANIFEST_PATH = (
@@ -63,7 +63,7 @@ def main():
         )
 
         batch_paths = [
-            PROJECT_ROOT / path
+            PROJECT_ROOT / norm_path(path)
             for path in image_paths[start:end]
         ]
 

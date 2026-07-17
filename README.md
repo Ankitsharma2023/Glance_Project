@@ -1,5 +1,12 @@
 # Fashion-Aware Context Retrieval
 
+> **Improvements addendum:** see [`IMPROVEMENTS.md`](IMPROVEMENTS.md) for a measured
+> accuracy pass on top of this system — a Marqo-FashionSigLIP backbone
+> (Precision@5 0.933 → 0.960, mAP 0.963 → 0.991) and pixel-HSV color verification
+> that fixes the color-binding limitation. The app ships the improved retriever
+> (`src/retriever/retriever_v2.py`); the objective eval harness is in
+> `evaluation/harness/`.
+
 Natural-language image search over a 1,000-image Fashionpedia corpus. Queries can combine
 garment attributes, style, and scene context (e.g. *"a red tie and a white shirt in a formal
 setting"*), and the system returns the top-k matching images. Built for the Glance ML
@@ -65,18 +72,43 @@ python scripts\prepare_annotated_dataset.py
 python scripts\build_index.py
 python scripts\build_fashion_index.py
 python scripts\build_region_index.py
+python scripts\build_region_colors.py     # pixel-HSV color descriptors (improvement)
+python scripts\build_marqo_indexes.py     # Marqo-FashionSigLIP backbone (improvement)
 ```
+
+**macOS note:** faiss and torch both bundle OpenMP; on macOS run every build /
+eval / app command with `KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1` to avoid a
+silent segfault. (Not needed on the original Windows setup.)
 
 Models (FashionCLIP, OpenCLIP weights) download automatically from Hugging Face on first
 run. CPU is sufficient; CUDA is used automatically if available.
 
 ## Run
 
-App:
+The demo is a **React (Vite) frontend + FastAPI backend**. The backend wraps the
+retriever; the frontend is a Glance-themed search UI that proxies `/api` to it.
+
+One command (starts both; open the printed Vite URL):
 
 ```
-streamlit run app.py
+./run.sh
 ```
+
+Or manually, in two terminals:
+
+```
+# terminal 1 — API (http://127.0.0.1:8000)
+KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
+  ./venv/bin/python -m uvicorn server.main:app --port 8000
+
+# terminal 2 — frontend (http://localhost:5173)
+cd web && npm install && npm run dev
+```
+
+The UI exposes, beyond text search: parsed query interpretation, per-result
+component score bars, live **backbone** (Marqo ↔ FashionCLIP) and **colour-gate**
+ablation toggles, adjustable **fusion weights**, and **image-to-image "find
+similar looks"**. Models download from Hugging Face on first run (CPU is fine).
 
 Evaluation (separate from normal app usage):
 
@@ -131,12 +163,15 @@ benchmarked at 1M images.
 ## Repository Structure
 
 ```
-app.py                      Streamlit search UI
-src/indexer/encoders.py     CLIP + FashionCLIP encoder wrappers
+web/                        React (Vite) frontend — Glance-themed search UI
+server/main.py              FastAPI backend wrapping the retriever
+run.sh                      Launch backend + frontend together
+src/indexer/encoders.py     CLIP + FashionCLIP (+ Marqo) encoder wrappers
 src/retriever/              Query parsing, retrieval, scoring, fusion
-scripts/                    Dataset preparation and index building
+                            (retriever_v2.py = improved, shipped)
+scripts/                    Dataset prep, index building, Marqo + colour descriptors
 evaluation/                 Queries, evaluation runner, labeling tool, metrics
+evaluation/harness/         Objective config-vs-config eval + reusable label store
 data/metadata/              Image manifest + Fashionpedia garment annotations (tracked)
 data/raw/, data/features/   Images, embeddings, FAISS indexes (generated, not in Git)
-outputs/                    Generated visualizations (not in Git)
 ```

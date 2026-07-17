@@ -8,4 +8,6 @@ Pillow
 matplotlib
 PyYAML
 transformers
-streamlit
+fastapi
+uvicorn[standard]
+python-multipart

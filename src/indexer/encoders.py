@@ -1,8 +1,19 @@
 import torch
 import open_clip
 import numpy as np
+from pathlib import Path
 from PIL import Image
 from transformers import CLIPModel, CLIPProcessor
+
+
+def norm_path(stored_path):
+    """Normalize a stored dataset path to the current OS separator.
+
+    The metadata CSVs were written on Windows (``data\\raw\\img_0000.jpg``);
+    on POSIX the backslashes would otherwise be treated as part of the
+    filename. Kept here so every builder/retriever resolves paths the same way.
+    """
+    return Path(str(stored_path).replace("\\", "/"))
 
 class CLIPEncoder:
     def __init__(
@@ -161,20 +172,13 @@ class FashionCLIPEncoder:
             "pixel_values"
         ].to(self.device)
 
+        # get_image_features applies the visual projection internally and is
+        # stable across transformers versions (the manual vision_model(...,
+        # return_dict=True) + visual_projection path broke in transformers
+        # >=4.5x, where submodule forward() no longer accepts return_dict).
         with torch.inference_mode():
-            vision_outputs = self.model.vision_model(
+            embeddings = self.model.get_image_features(
                 pixel_values=pixel_values,
-                return_dict=True,
-            )
-
-            pooled_output = (
-                vision_outputs.pooler_output
-            )
-
-            embeddings = (
-                self.model.visual_projection(
-                    pooled_output
-                )
             )
 
         embeddings = (
@@ -204,21 +208,12 @@ class FashionCLIPEncoder:
             "attention_mask"
         ].to(self.device)
 
+        # get_text_features applies the text projection internally and is
+        # stable across transformers versions (see encode_images note).
         with torch.inference_mode():
-            text_outputs = self.model.text_model(
+            embeddings = self.model.get_text_features(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                return_dict=True,
-            )
-
-            pooled_output = (
-                text_outputs.pooler_output
-            )
-
-            embeddings = (
-                self.model.text_projection(
-                    pooled_output
-                )
             )
 
         embeddings = (
