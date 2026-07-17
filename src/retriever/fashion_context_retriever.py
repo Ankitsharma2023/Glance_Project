@@ -17,8 +17,38 @@ from src.indexer.encoders import (
 FEATURE_DIR = PROJECT_ROOT / "data" / "features"
 
 CANDIDATE_K = 100
-COVERAGE_THRESHOLD = 0.25
 CONTEXT_NEGATIVE_WEIGHT = 0.50
+
+# R4: candidate-relative clause match calibration. A clause is "matched" for
+# a candidate when its raw region score clears max(floor, this percentile of
+# that same clause's score distribution across the current candidate pool).
+# This replaces a single fixed cosine cutoff shared by every clause: rare
+# garment categories (few annotated regions in the pool) naturally produce a
+# low/zero pool percentile, so real-but-weak evidence can still count as a
+# match, while common categories still need to beat roughly half the pool.
+CLAUSE_MATCH_PERCENTILE = 50
+CLAUSE_MATCH_ABSOLUTE_FLOOR = 0.05
+
+# Region hits retrieved per fashion clause from the region-crop FAISS index.
+# Clause-level region retrieval widens candidate recall for compositional
+# queries (e.g. "red tie and white shirt") whose satisfying images may not
+# rank inside the whole-query global candidates. Set to 0 to disable.
+REGION_CANDIDATE_K = 50
+
+# EXPERIMENTAL (disabled by default): contrastive color-prompt scoring.
+# A "{color} {garment}" clause score is discounted by how well the SAME
+# crop (already selected by the existing MaxSim logic) also matches every
+# OTHER color for that garment, mirroring the CONTEXT_PROTOTYPES
+# positive-minus-weighted-negative pattern. A labeled A/B at weight 0.50
+# (evaluation/experiments/color_contrast/retrieval_results_w050.csv vs
+# evaluation/retrieval_results.csv) showed
+# a genuine trade-off: compositional nDCG@5 improved 0.912 -> 0.945 and a
+# confirmed red-jacket false positive was removed, but overall P@5 dropped
+# 0.933 -> 0.907 and yellow-attribute queries regressed (yellow-vs-beige
+# is a boundary these embeddings cannot separate reliably). The submitted
+# configuration therefore keeps this OFF (0.0 = disabled, exact validated
+# post-R1/R4 baseline behavior); set to e.g. 0.50 to reproduce the A/B.
+COLOR_CONTRAST_WEIGHT = 0.0
 
 
 COLORS = {
@@ -212,6 +242,7 @@ def parse_query(query):
                     "text": f"{color} {garment}",
                     "garment": garment,
                     "category_ids": GARMENT_ALIASES[garment],
+                    "color": color,
                 }
             )
 
@@ -229,6 +260,7 @@ def parse_query(query):
                 "text": token,
                 "garment": token,
                 "category_ids": GARMENT_ALIASES[token],
+                "color": None,
             }
         )
 
@@ -304,6 +336,19 @@ class FashionContextRetriever:
         if len(self.region_embeddings) != len(self.region_mapping):
             raise RuntimeError("Region embedding/mapping mismatch.")
 
+        # Region-crop index used for clause-level candidate generation.
+        # Row order matches region_mapping (checked above).
+        self.region_index = faiss.read_index(
+            str(FEATURE_DIR / "region_fashionclip.faiss")
+        )
+
+        # image_id -> row position in image_mapping (the coordinate system
+        # of the global candidate pool and embedding matrices).
+        self.image_positions = {
+            image_id: position
+            for position, image_id in enumerate(self.image_mapping["image_id"])
+        }
+
         self.fashion_encoder = FashionCLIPEncoder()
 
         self.context_encoder = CLIPEncoder()
@@ -328,6 +373,38 @@ class FashionContextRetriever:
 
         clip_query_embedding = self.context_encoder.encode_texts([query])
 
+        if fashion_clauses:
+            clause_texts = [clause["text"] for clause in fashion_clauses]
+
+            clause_embeddings = self.fashion_encoder.encode_texts(clause_texts)
+
+            # Contrastive color scoring (experimental, disabled when
+            # COLOR_CONTRAST_WEIGHT is 0): for each clause with a captured
+            # color, precompute embeddings for the same garment paired with
+            # every other known color, once per query (not per candidate).
+            clause_color_negative_embeddings = []
+
+            for clause in fashion_clauses:
+                color = clause.get("color")
+
+                if color is None or COLOR_CONTRAST_WEIGHT <= 0:
+                    clause_color_negative_embeddings.append(None)
+                    continue
+
+                other_colors = sorted(COLORS - {color})
+
+                negative_texts = [
+                    f"{other_color} {clause['garment']}" for other_color in other_colors
+                ]
+
+                clause_color_negative_embeddings.append(
+                    self.fashion_encoder.encode_texts(negative_texts)
+                )
+        else:
+            clause_texts = []
+            clause_embeddings = None
+            clause_color_negative_embeddings = []
+
         _, fashion_indices = self.fashion_index.search(
             fashion_query_embedding,
             CANDIDATE_K,
@@ -338,22 +415,43 @@ class FashionContextRetriever:
             CANDIDATE_K,
         )
 
+        # Clause-level region retrieval: search the region-crop index with
+        # each parsed fashion clause (e.g. "red tie") so images containing a
+        # matching garment region enter the candidate pool even when the
+        # whole-query global searches miss them. This only improves candidate
+        # recall for compositional queries; scoring and reranking below are
+        # unchanged.
+        region_candidate_positions = []
+
+        if clause_embeddings is not None and REGION_CANDIDATE_K > 0:
+            _, region_hits = self.region_index.search(
+                clause_embeddings,
+                REGION_CANDIDATE_K,
+            )
+
+            for clause_hits in region_hits:
+                hit_image_ids = self.region_mapping["image_id"].iloc[clause_hits]
+
+                for image_id in hit_image_ids:
+                    position = self.image_positions.get(image_id)
+
+                    if position is not None:
+                        region_candidate_positions.append(position)
+
         candidate_indices = np.asarray(
-            list(dict.fromkeys(fashion_indices[0].tolist() + clip_indices[0].tolist())),
+            list(
+                dict.fromkeys(
+                    fashion_indices[0].tolist()
+                    + clip_indices[0].tolist()
+                    + region_candidate_positions
+                )
+            ),
             dtype=np.int64,
         )
 
         global_scores = (
             self.fashion_embeddings[candidate_indices] @ fashion_query_embedding[0]
         ).astype(np.float32)
-
-        if fashion_clauses:
-            clause_texts = [clause["text"] for clause in fashion_clauses]
-
-            clause_embeddings = self.fashion_encoder.encode_texts(clause_texts)
-        else:
-            clause_texts = []
-            clause_embeddings = None
 
         context_text = parsed["context"]
 
@@ -418,7 +516,34 @@ class FashionContextRetriever:
 
                     similarities = embeddings @ clause_embeddings[clause_index]
 
-                    clause_scores.append(float(similarities.max()))
+                    best_position = int(np.argmax(similarities))
+
+                    positive_score = float(similarities[best_position])
+
+                    # Contrastive color check: does the SAME crop chosen
+                    # above (crop/category selection is unchanged) also
+                    # match other colors for this garment about as well?
+                    # If so, the match is likely driven by garment shape,
+                    # not the queried color, and the score is discounted.
+                    color_negative_embeddings = clause_color_negative_embeddings[
+                        clause_index
+                    ]
+
+                    if color_negative_embeddings is not None:
+                        best_crop_embedding = embeddings[best_position]
+
+                        negative_score = float(
+                            np.max(color_negative_embeddings @ best_crop_embedding)
+                        )
+
+                        clause_score = (
+                            positive_score
+                            - COLOR_CONTRAST_WEIGHT * negative_score
+                        )
+                    else:
+                        clause_score = positive_score
+
+                    clause_scores.append(clause_score)
 
             elif fashion_clauses:
                 clause_scores = [0.0 for _ in fashion_clauses]
@@ -438,16 +563,14 @@ class FashionContextRetriever:
                 else:
                     region_score = mean_score
 
-                matched = clause_array >= COVERAGE_THRESHOLD
-
-                coverage_score = float(np.mean(matched))
-
-                all_matched = float(np.all(matched))
-
             else:
                 region_score = 0.0
-                coverage_score = 0.0
-                all_matched = 0.0
+
+            # coverage_score / all_clauses_matched depend on the full
+            # candidate pool (R4 calibration) and are filled in below, after
+            # every candidate's raw clause_scores has been collected.
+            coverage_score = 0.0
+            all_matched = 0.0
 
             if context_embedding is not None:
 
@@ -491,6 +614,36 @@ class FashionContextRetriever:
             )
 
         results = pd.DataFrame(result_rows)
+
+        # R4: candidate-relative clause match calibration. Compare each
+        # candidate's raw clause score against that clause's own score
+        # distribution across this query's candidate pool, instead of one
+        # fixed cosine cutoff shared by every clause regardless of how rare
+        # or common its garment category is in the pool.
+        if fashion_clauses:
+            clause_matrix = np.asarray(
+                results["clause_scores"].tolist(),
+                dtype=np.float32,
+            )
+
+            relative_thresholds = np.percentile(
+                clause_matrix,
+                CLAUSE_MATCH_PERCENTILE,
+                axis=0,
+            )
+
+            match_thresholds = np.maximum(
+                relative_thresholds,
+                CLAUSE_MATCH_ABSOLUTE_FLOOR,
+            )
+
+            matched_matrix = clause_matrix >= match_thresholds
+
+            results["coverage_score"] = matched_matrix.mean(axis=1)
+
+            results["all_clauses_matched"] = matched_matrix.all(axis=1).astype(
+                np.float32
+            )
 
         results["global_norm"] = minmax(results["global_score"])
 
